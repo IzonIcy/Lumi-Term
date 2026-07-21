@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 directories = "5.0"
-eframe = { version = "0.34.2", default-features = true }
+eframe = { version = "0.35.0", default-features = true }
 portable-pty = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
