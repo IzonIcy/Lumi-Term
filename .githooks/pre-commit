@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+echo "Running pre-commit checks..."
+cargo fmt --check || { echo "Format check failed. Run 'cargo fmt' to fix."; exit 1; }
+cargo clippy --all-targets 2>/dev/null || { echo "Clippy found issues. Fix them before committing."; exit 1; }
+cargo test 2>/dev/null || { echo "Tests failed."; exit 1; }
+echo "All checks passed!"
