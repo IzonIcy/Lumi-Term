@@ -1,4 +1,5 @@
 #[test]
 fn test_lib_compiles() {
-    assert!(true, "Basic smoke test passed");
+    // Basic smoke test to verify the crate compiles and tests run
+    assert_eq!(2 + 2, 4);
 }

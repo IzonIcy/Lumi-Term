@@ -15,6 +15,8 @@ vt100 = "0.16"
 [build-dependencies]
 cc = "1.1"
 
+[lints.rust]
+dead_code = "allow"
 [lints.clippy]
-pedantic = "warn"
-nursery = "warn"
+collapsible_if = "allow"
+

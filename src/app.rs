@@ -226,8 +226,7 @@ impl LumiTermApp {
                     self.copy_visible_text(ctx);
                 }
                 egui::Event::Text(text) => {
-                    let filtered: String =
-                        text.chars().filter(|char| !char.is_control()).collect();
+                    let filtered: String = text.chars().filter(|char| !char.is_control()).collect();
                     if !filtered.is_empty() {
                         if let Some(tab) = self.active_tab_mut() {
                             tab.follow_output = true;
@@ -268,7 +267,9 @@ impl LumiTermApp {
                         }
                         continue;
                     }
-                    if key == egui::Key::C && modifiers.shift && (modifiers.command || modifiers.ctrl)
+                    if key == egui::Key::C
+                        && modifiers.shift
+                        && (modifiers.command || modifiers.ctrl)
                     {
                         self.copy_visible_text(ctx);
                         continue;
@@ -788,9 +789,8 @@ fn fallback_cell_metrics(font_size: f32) -> CellMetrics {
 
 fn cell_metrics_from_context(ctx: &egui::Context, font_size: f32) -> CellMetrics {
     let font_id = egui::FontId::monospace(font_size);
-    let (width, height) = ctx.fonts_mut(|fonts| {
-        (fonts.glyph_width(&font_id, 'W'), fonts.row_height(&font_id))
-    });
+    let (width, height) =
+        ctx.fonts_mut(|fonts| (fonts.glyph_width(&font_id, 'W'), fonts.row_height(&font_id)));
     let metrics = CellMetrics { width, height };
     if metrics.width <= 0.0 || metrics.height <= 0.0 {
         fallback_cell_metrics(font_size)
