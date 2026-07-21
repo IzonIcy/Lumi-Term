@@ -31,6 +31,8 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
+        env:
+          RUSTFLAGS: "--allow falling-back-to-f32-from-f64"
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
