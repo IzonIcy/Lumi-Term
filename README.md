@@ -1,5 +1,7 @@
 # Lumi-Term
 
+[![CI](https://github.com/IzonIcy/Lumi-Term/actions/workflows/ci.yml/badge.svg)](https://github.com/IzonIcy/Lumi-Term/actions/workflows/ci.yml)
+
 A terminal emulator written in Rust. GPU-rendered, real PTY shell, custom VT parser.
 
 ## Why
