@@ -88,7 +88,6 @@ pub struct LumiTermApp {
     session_title: String,
     rows: u16,
     cols: u16,
-    request_close_window: bool,
 }
 
 impl LumiTermApp {
@@ -118,7 +117,6 @@ impl LumiTermApp {
             session_title: format_session_title(),
             rows,
             cols,
-            request_close_window: false,
         })
     }
 
@@ -140,7 +138,6 @@ impl LumiTermApp {
             session_title: "Lumi-Term".to_owned(),
             rows: MIN_TERM_ROWS,
             cols: MIN_TERM_COLS,
-            request_close_window: false,
         }
     }
 

@@ -20,7 +20,7 @@ pub struct CellStyle {
     pub inverse: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StyledSpan {
     pub text: String,
     pub style: CellStyle,
@@ -180,76 +180,220 @@ impl TerminalSession {
     }
 
     pub fn snapshot(&self) -> TerminalSnapshot {
-        let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let mut styled_rows = Vec::with_capacity(rows as usize);
-        let cursor = if screen.scrollback() == 0 {
-            Some((cursor_row, cursor_col))
-        } else {
-            None
-        };
+        screen_to_snapshot(&self.parser)
+    }
+}
 
-        for row in 0..rows {
-            let mut spans = Vec::<StyledSpan>::new();
-            let mut current_span: Option<StyledSpan> = None;
+/// Converts the current vt100 screen state into coalesced styled spans.
+///
+/// Pure function of the parser state so rendering logic can be unit-tested
+/// without a live PTY.
+pub fn screen_to_snapshot(parser: &Parser) -> TerminalSnapshot {
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let mut styled_rows = Vec::with_capacity(rows as usize);
+    let cursor = if screen.scrollback() == 0 {
+        Some((cursor_row, cursor_col))
+    } else {
+        None
+    };
 
-            for col in 0..cols {
-                let mut style = CellStyle {
-                    fg: Color::Default,
-                    bg: Color::Default,
-                    bold: false,
-                    dim: false,
-                    italic: false,
-                    underline: false,
-                    inverse: false,
+    for row in 0..rows {
+        let mut spans = Vec::<StyledSpan>::new();
+        let mut current_span: Option<StyledSpan> = None;
+
+        for col in 0..cols {
+            let mut style = CellStyle {
+                fg: Color::Default,
+                bg: Color::Default,
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+            };
+            let mut text = " ".to_owned();
+
+            if let Some(cell) = screen.cell(row, col) {
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                style = CellStyle {
+                    fg: cell.fgcolor(),
+                    bg: cell.bgcolor(),
+                    bold: cell.bold(),
+                    dim: cell.dim(),
+                    italic: cell.italic(),
+                    underline: cell.underline(),
+                    inverse: cell.inverse(),
                 };
-                let mut text = " ".to_owned();
-
-                if let Some(cell) = screen.cell(row, col) {
-                    if cell.is_wide_continuation() {
-                        continue;
-                    }
-                    style = CellStyle {
-                        fg: cell.fgcolor(),
-                        bg: cell.bgcolor(),
-                        bold: cell.bold(),
-                        dim: cell.dim(),
-                        italic: cell.italic(),
-                        underline: cell.underline(),
-                        inverse: cell.inverse(),
-                    };
-                    if cell.has_contents() {
-                        text = cell.contents().to_owned();
-                    }
-                }
-
-                if cursor == Some((row, col)) {
-                    style.inverse = !style.inverse;
-                }
-
-                match current_span.as_mut() {
-                    Some(span) if span.style == style => span.text.push_str(&text),
-                    Some(_) => {
-                        if let Some(span) = current_span.take() {
-                            spans.push(span);
-                        }
-                        current_span = Some(StyledSpan { text, style });
-                    }
-                    None => current_span = Some(StyledSpan { text, style }),
+                if cell.has_contents() {
+                    text = cell.contents().to_owned();
                 }
             }
 
-            if let Some(span) = current_span {
-                spans.push(span);
+            if cursor == Some((row, col)) {
+                style.inverse = !style.inverse;
             }
 
-            styled_rows.push(spans);
+            match current_span.as_mut() {
+                Some(span) if span.style == style => span.text.push_str(&text),
+                Some(_) => {
+                    if let Some(span) = current_span.take() {
+                        spans.push(span);
+                    }
+                    current_span = Some(StyledSpan { text, style });
+                }
+                None => current_span = Some(StyledSpan { text, style }),
+            }
         }
 
-        TerminalSnapshot {
-            rows: styled_rows,
-            at_scrollback_top: screen.scrollback() > 0,
+        if let Some(span) = current_span {
+            spans.push(span);
         }
+
+        styled_rows.push(spans);
+    }
+
+    TerminalSnapshot {
+        rows: styled_rows,
+        at_scrollback_top: screen.scrollback() > 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CellStyle, screen_to_snapshot};
+    use vt100::{Color, Parser};
+
+    fn parse_with_size(rows: u16, cols: u16, input: &str) -> Parser {
+        let mut parser = Parser::new(rows, cols, 10_000);
+        parser.process(input.as_bytes());
+        parser
+    }
+
+    fn row_text(snapshot: &super::TerminalSnapshot, row: usize) -> String {
+        snapshot.rows[row]
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn plain_text_becomes_single_span_per_row() {
+        let parser = parse_with_size(3, 12, "hello world");
+        let snapshot = screen_to_snapshot(&parser);
+
+        assert_eq!(row_text(&snapshot, 0), "hello world ");
+        assert_eq!(
+            snapshot.rows[0].len(),
+            2,
+            "text span plus inverted cursor cell"
+        );
+        assert_eq!(snapshot.rows[0][0].style.fg, Color::Default);
+        assert!(!snapshot.rows[0][0].style.bold);
+        assert!(!snapshot.at_scrollback_top);
+    }
+
+    #[test]
+    fn style_changes_split_spans() {
+        let parser = parse_with_size(2, 20, "\x1b[31mred\x1b[1mredbold\x1b[0mplain");
+        let snapshot = screen_to_snapshot(&parser);
+        let spans = &snapshot.rows[0];
+
+        // cursor sits on the empty cell right after "plain", splitting the
+        // trailing whitespace: [red][redbold][plain][cursor][trailing]
+        assert_eq!(spans.len(), 5);
+        assert_eq!(spans[0].text, "red");
+        assert_eq!(spans[0].style.fg, Color::Idx(1));
+        assert!(!spans[0].style.bold);
+        assert_eq!(spans[1].text, "redbold");
+        assert_eq!(spans[1].style.fg, Color::Idx(1));
+        assert!(spans[1].style.bold);
+        assert_eq!(spans[2].text, "plain");
+        assert_eq!(spans[2].style.fg, Color::Default);
+        assert!(!spans[2].style.bold);
+        assert!(spans[3].style.inverse, "cursor cell is inverted");
+    }
+
+    #[test]
+    fn cursor_is_rendered_inverse_on_live_screen_only() {
+        let parser = parse_with_size(2, 10, "abc");
+        let snapshot = screen_to_snapshot(&parser);
+
+        let spans = &snapshot.rows[0];
+        assert_eq!(spans.len(), 3, "[abc][cursor][trailing]");
+        assert_eq!(spans[0].text, "abc");
+        assert!(spans[1].style.inverse, "cursor cell should be inverted");
+        assert_eq!(spans[1].text, " ");
+        assert!(!spans[2].style.inverse);
+    }
+
+    #[test]
+    fn cursor_inversion_disappears_in_scrollback() {
+        let mut parser = Parser::new(2, 10, 10_000);
+        // Push several lines so content scrolls off the live screen.
+        for line in 0..6 {
+            parser.process(format!("line {line}\r\n").as_bytes());
+        }
+        parser.screen_mut().set_scrollback(1);
+        let snapshot = screen_to_snapshot(&parser);
+
+        assert!(snapshot.at_scrollback_top);
+        assert!(
+            snapshot
+                .rows
+                .iter()
+                .flatten()
+                .all(|span| !span.style.inverse),
+            "no cursor marker while scrolled back"
+        );
+    }
+
+    #[test]
+    fn wide_characters_occupy_two_columns_but_one_span() {
+        // '中' is a wide char occupying two columns.
+        let parser = parse_with_size(1, 6, "中");
+        let snapshot = screen_to_snapshot(&parser);
+        assert_eq!(row_text(&snapshot, 0), "中    ", "wide char + 4 empty cols");
+
+        let spans = &snapshot.rows[0];
+        assert_eq!(spans[0].text, "中", "continuation cell must not duplicate");
+    }
+
+    #[test]
+    fn empty_screen_has_one_space_span_per_cell() {
+        let parser = parse_with_size(1, 3, "");
+        let snapshot = screen_to_snapshot(&parser);
+        let spans = &snapshot.rows[0];
+
+        let total: usize = spans.iter().map(|span| span.text.len()).sum();
+        assert_eq!(total, 3, "each empty cell contributes a space");
+    }
+
+    #[test]
+    fn colors_roundtrip_through_cell_style() {
+        let parser = parse_with_size(1, 10, "\x1b[48;5;196mX\x1b[0mY");
+        let snapshot = screen_to_snapshot(&parser);
+        let spans = &snapshot.rows[0];
+
+        assert_eq!(spans[0].text, "X");
+        assert_eq!(spans[0].style.bg, Color::Idx(196));
+        assert_eq!(spans[1].text, "Y");
+        assert_eq!(spans[1].style.bg, Color::Default);
+
+        assert_eq!(
+            spans[0].style,
+            CellStyle {
+                fg: Color::Default,
+                bg: Color::Idx(196),
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+            }
+        );
     }
 }

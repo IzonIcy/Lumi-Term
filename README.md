@@ -2,10 +2,7 @@
 
 [![CI](https://github.com/IzonIcy/Lumi-Term/actions/workflows/ci.yml/badge.svg)](https://github.com/IzonIcy/Lumi-Term/actions/workflows/ci.yml)
 
-A terminal emulator written in Rust. GPU-rendered, real PTY shell, custom VT parser.
-
-## Why
-
+A terminal emulator written in Rust. GPU-rendered, real PTY shell, VT parsing via the `vt100` crate.
 I wanted to understand how terminals actually work — the whole stack from keystroke to character appearing on screen. Building one seemed like the best way to learn. It's not xterm-level complete but it runs a real shell, renders via the GPU, and handles most common escape sequences.
 
 ## How it works
