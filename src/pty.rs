@@ -396,4 +396,44 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn sgr_attributes_roundtrip_through_cell_style() {
+        // italic (3), underline (4), inverse (7).
+        let parser = parse_with_size(1, 12, "\x1b[3;4;7mX\x1b[0mY");
+        let snapshot = screen_to_snapshot(&parser);
+        let spans = &snapshot.rows[0];
+
+        assert_eq!(spans[0].text, "X");
+        assert!(spans[0].style.italic);
+        assert!(spans[0].style.underline);
+        assert!(spans[0].style.inverse);
+
+        assert_eq!(spans[1].text, "Y", "reset sequence clears attributes");
+        assert!(!spans[1].style.italic);
+        assert!(!spans[1].style.underline);
+        assert!(!spans[1].style.inverse);
+    }
+
+    #[test]
+    fn sgr_intensity_is_a_single_axis_with_last_one_wins() {
+        // Bold (1) and dim (2) share one intensity field in vt100 — they are
+        // mutually exclusive, and the later sequence replaces the earlier.
+        let parser = parse_with_size(1, 12, "\x1b[1mA\x1b[2mB\x1b[1mC");
+        let snapshot = screen_to_snapshot(&parser);
+        let spans = &snapshot.rows[0];
+
+        assert!(spans[0].style.bold, "SGR 1 sets bold");
+        assert!(!spans[0].style.dim);
+
+        assert!(
+            !spans[1].style.bold && spans[1].style.dim,
+            "SGR 2 replaces bold with dim"
+        );
+
+        assert!(
+            spans[2].style.bold && !spans[2].style.dim,
+            "SGR 1 replaces dim with bold"
+        );
+    }
 }
