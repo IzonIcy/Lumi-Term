@@ -23,5 +23,7 @@ RUN apt-get update && apt-get install -y \
     libxcursor1 libxrandr2 libxi6 libgl1-mesa-glx \
     libegl1 && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/lumi-term /usr/local/bin/lumi-term
+RUN useradd --create-home --uid 1000 lumi
+USER lumi
 
 CMD ["lumi-term"]
