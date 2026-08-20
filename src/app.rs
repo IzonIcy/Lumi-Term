@@ -925,3 +925,555 @@ fn format_session_title() -> String {
         .unwrap_or_else(|_| "lumi".to_owned());
     format!("{user}@{host}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain_span(text: &str) -> StyledSpan {
+        StyledSpan {
+            text: text.to_owned(),
+            style: CellStyle {
+                fg: Color::Default,
+                bg: Color::Default,
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+            },
+        }
+    }
+
+    fn theme_fg() -> Color32 {
+        Color32::from_rgb(200, 200, 200)
+    }
+
+    fn theme_bg() -> Color32 {
+        Color32::from_rgb(10, 10, 10)
+    }
+
+    // ---- xterm 256-color palette ----
+
+    #[test]
+    fn xterm_ansi_16_colors_match_palette() {
+        assert_eq!(xterm_index_to_rgb(0), Color32::from_rgb(0, 0, 0));
+        assert_eq!(xterm_index_to_rgb(1), Color32::from_rgb(205, 49, 49));
+        assert_eq!(xterm_index_to_rgb(7), Color32::from_rgb(229, 229, 229));
+        assert_eq!(xterm_index_to_rgb(15), Color32::from_rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn xterm_color_cube_edges_are_consistent() {
+        // First and last entries of the 6x6x6 cube.
+        assert_eq!(xterm_index_to_rgb(16), Color32::from_rgb(0, 0, 0));
+        assert_eq!(xterm_index_to_rgb(21), Color32::from_rgb(0, 0, 255));
+        assert_eq!(xterm_index_to_rgb(196), Color32::from_rgb(255, 0, 0));
+        assert_eq!(xterm_index_to_rgb(231), Color32::from_rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn xterm_gray_ramp_starts_at_8_and_steps_by_10() {
+        assert_eq!(xterm_index_to_rgb(232), Color32::from_rgb(8, 8, 8));
+        assert_eq!(xterm_index_to_rgb(233), Color32::from_rgb(18, 18, 18));
+        assert_eq!(xterm_index_to_rgb(255), Color32::from_rgb(238, 238, 238));
+    }
+
+    // ---- color resolution ----
+
+    #[test]
+    fn resolve_vt_color_maps_each_color_variant() {
+        let fallback = Color32::from_rgb(9, 9, 9);
+        assert_eq!(resolve_vt_color(Color::Default, fallback), fallback);
+        assert_eq!(
+            resolve_vt_color(Color::Idx(1), fallback),
+            Color32::from_rgb(205, 49, 49)
+        );
+        assert_eq!(
+            resolve_vt_color(Color::Rgb(1, 2, 3), fallback),
+            Color32::from_rgb(1, 2, 3)
+        );
+    }
+
+    #[test]
+    fn resolve_colors_default_style_uses_theme_palette() {
+        let (fg, bg) = resolve_colors(plain_span("x").style, theme_fg(), theme_bg());
+        assert_eq!((fg, bg), (theme_fg(), theme_bg()));
+    }
+
+    #[test]
+    fn resolve_colors_inverse_swaps_foreground_and_background() {
+        let style = CellStyle {
+            inverse: true,
+            ..plain_span("x").style
+        };
+        let (fg, bg) = resolve_colors(style, theme_fg(), theme_bg());
+        assert_eq!(fg, theme_bg());
+        assert_eq!(bg, theme_fg());
+    }
+
+    #[test]
+    fn resolve_colors_bold_brightens_and_dim_darkens() {
+        let base = CellStyle {
+            fg: Color::Rgb(100, 100, 100),
+            ..plain_span("x").style
+        };
+        let (plain_fg, _) = resolve_colors(base, theme_fg(), theme_bg());
+        assert_eq!(plain_fg, Color32::from_rgb(100, 100, 100));
+
+        let (bold_fg, _) = resolve_colors(CellStyle { bold: true, ..base }, theme_fg(), theme_bg());
+        assert_ne!(bold_fg, plain_fg, "bold should brighten the foreground");
+
+        let (dim_fg, _) = resolve_colors(CellStyle { dim: true, ..base }, theme_fg(), theme_bg());
+        assert_ne!(dim_fg, plain_fg, "dim should darken the foreground");
+    }
+
+    // ---- grid sizing ----
+
+    #[test]
+    fn estimates_grid_from_window_and_cell_metrics() {
+        let metrics = fallback_cell_metrics(16.0);
+        // 1280 / 9.6 = 133.3 -> 133 cols; 760 / 21.12 = 35.98 -> 35 rows.
+        assert_eq!(estimate_grid_size(1280.0, 760.0, metrics), (35, 133));
+    }
+
+    #[test]
+    fn grid_size_never_drops_below_minimum() {
+        let metrics = fallback_cell_metrics(16.0);
+        assert_eq!(
+            estimate_grid_size(0.0, 0.0, metrics),
+            (MIN_TERM_ROWS, MIN_TERM_COLS)
+        );
+        assert_eq!(
+            estimate_grid_size(5.0, 5.0, metrics),
+            (MIN_TERM_ROWS, MIN_TERM_COLS)
+        );
+    }
+
+    #[test]
+    fn degenerate_cell_metrics_are_floored_at_one_pixel() {
+        let metrics = CellMetrics {
+            width: 0.0,
+            height: 0.0,
+        };
+        assert_eq!(estimate_grid_size(10.0, 20.0, metrics), (20, 10));
+    }
+
+    #[test]
+    fn fallback_cell_metrics_scale_with_font_size() {
+        let metrics = fallback_cell_metrics(16.0);
+        assert!((metrics.width - 9.6).abs() < 0.001);
+        assert!((metrics.height - 21.12).abs() < 0.001);
+
+        let larger = fallback_cell_metrics(32.0);
+        assert!((larger.width - 19.2).abs() < 0.001);
+        assert!((larger.height - 42.24).abs() < 0.001);
+    }
+
+    // ---- key to terminal byte mapping ----
+
+    #[test]
+    fn maps_plain_editing_keys_to_terminal_sequences() {
+        let none = egui::Modifiers::NONE;
+        assert_eq!(
+            map_key_to_bytes(egui::Key::Enter, none),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::Backspace, none),
+            Some(b"\x7f".to_vec())
+        );
+        assert_eq!(map_key_to_bytes(egui::Key::Tab, none), Some(b"\t".to_vec()));
+        assert_eq!(
+            map_key_to_bytes(egui::Key::Escape, none),
+            Some(b"\x1b".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::ArrowUp, none),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::ArrowDown, none),
+            Some(b"\x1b[B".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::ArrowRight, none),
+            Some(b"\x1b[C".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::ArrowLeft, none),
+            Some(b"\x1b[D".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::Home, none),
+            Some(b"\x1b[H".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::End, none),
+            Some(b"\x1b[F".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::Insert, none),
+            Some(b"\x1b[2~".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::Delete, none),
+            Some(b"\x1b[3~".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::PageUp, none),
+            Some(b"\x1b[5~".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::PageDown, none),
+            Some(b"\x1b[6~".to_vec())
+        );
+    }
+
+    #[test]
+    fn maps_function_keys_to_ss3_and_csi_sequences() {
+        let none = egui::Modifiers::NONE;
+        // F1-F4 must use SS3 (0P-0S), not CSI - a classic terminal emulator bug.
+        assert_eq!(
+            map_key_to_bytes(egui::Key::F1, none),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::F2, none),
+            Some(b"\x1bOQ".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::F3, none),
+            Some(b"\x1bOR".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::F4, none),
+            Some(b"\x1bOS".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::F5, none),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::F10, none),
+            Some(b"\x1b[21~".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::F11, none),
+            Some(b"\x1b[23~".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::F12, none),
+            Some(b"\x1b[24~".to_vec())
+        );
+    }
+
+    #[test]
+    fn maps_ctrl_letters_to_control_bytes() {
+        let ctrl = egui::Modifiers::CTRL;
+        assert_eq!(map_key_to_bytes(egui::Key::C, ctrl), Some(vec![0x03]));
+        assert_eq!(map_key_to_bytes(egui::Key::D, ctrl), Some(vec![0x04]));
+        assert_eq!(map_key_to_bytes(egui::Key::L, ctrl), Some(vec![0x0c]));
+    }
+
+    #[test]
+    fn ctrl_takes_precedence_over_alt_for_letter_keys() {
+        let ctrl_alt = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(map_key_to_bytes(egui::Key::A, ctrl_alt), Some(vec![0x01]));
+    }
+
+    #[test]
+    fn ctrl_with_unmappable_key_falls_through_to_plain_mapping() {
+        assert_eq!(
+            map_key_to_bytes(egui::Key::ArrowUp, egui::Modifiers::CTRL),
+            Some(b"\x1b[A".to_vec())
+        );
+    }
+
+    #[test]
+    fn maps_alt_arrows_to_csi_modifier_3_sequences() {
+        assert_eq!(
+            map_key_to_bytes(egui::Key::ArrowUp, egui::Modifiers::ALT),
+            Some(b"\x1b[1;3A".to_vec())
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::ArrowLeft, egui::Modifiers::ALT),
+            Some(b"\x1b[1;3D".to_vec())
+        );
+    }
+
+    #[test]
+    fn maps_alt_shift_arrows_to_csi_modifier_4_sequences() {
+        let alt_shift = egui::Modifiers {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            map_key_to_bytes(egui::Key::ArrowDown, alt_shift),
+            Some(b"\x1b[1;4B".to_vec())
+        );
+    }
+
+    #[test]
+    fn shift_tab_emits_backwards_tab_sequence() {
+        assert_eq!(
+            map_key_to_bytes(egui::Key::Tab, egui::Modifiers::SHIFT),
+            Some(b"\x1b[Z".to_vec())
+        );
+    }
+
+    #[test]
+    fn unmapped_keys_produce_no_bytes() {
+        assert_eq!(
+            map_key_to_bytes(egui::Key::Space, egui::Modifiers::NONE),
+            None
+        );
+        assert_eq!(
+            map_key_to_bytes(egui::Key::C, egui::Modifiers::COMMAND),
+            None,
+            "command-only chords are handled elsewhere (copy)"
+        );
+    }
+
+    #[test]
+    fn ctrl_key_to_byte_covers_all_letters_in_order() {
+        let pairs = [
+            (egui::Key::A, 0x01),
+            (egui::Key::B, 0x02),
+            (egui::Key::C, 0x03),
+            (egui::Key::D, 0x04),
+            (egui::Key::E, 0x05),
+            (egui::Key::F, 0x06),
+            (egui::Key::G, 0x07),
+            (egui::Key::H, 0x08),
+            (egui::Key::I, 0x09),
+            (egui::Key::J, 0x0a),
+            (egui::Key::K, 0x0b),
+            (egui::Key::L, 0x0c),
+            (egui::Key::M, 0x0d),
+            (egui::Key::N, 0x0e),
+            (egui::Key::O, 0x0f),
+            (egui::Key::P, 0x10),
+            (egui::Key::Q, 0x11),
+            (egui::Key::R, 0x12),
+            (egui::Key::S, 0x13),
+            (egui::Key::T, 0x14),
+            (egui::Key::U, 0x15),
+            (egui::Key::V, 0x16),
+            (egui::Key::W, 0x17),
+            (egui::Key::X, 0x18),
+            (egui::Key::Y, 0x19),
+            (egui::Key::Z, 0x1a),
+        ];
+        for (key, byte) in pairs {
+            assert_eq!(ctrl_key_to_byte(key), Some(byte), "ctrl+{key:?}");
+        }
+        assert_eq!(ctrl_key_to_byte(egui::Key::Space), None);
+        assert_eq!(ctrl_key_to_byte(egui::Key::Enter), None);
+    }
+
+    #[test]
+    fn alt_modified_sequence_uses_modifier_3_without_shift() {
+        assert_eq!(
+            alt_modified_key_sequence(egui::Key::F5, false),
+            Some(b"\x1b[15;3~".to_vec())
+        );
+        assert_eq!(
+            alt_modified_key_sequence(egui::Key::Home, false),
+            Some(b"\x1b[1;3H".to_vec())
+        );
+        assert_eq!(alt_modified_key_sequence(egui::Key::Space, false), None);
+    }
+
+    #[test]
+    fn alt_modified_sequence_uses_modifier_4_with_shift() {
+        assert_eq!(
+            alt_modified_key_sequence(egui::Key::F12, true),
+            Some(b"\x1b[24;4~".to_vec())
+        );
+        assert_eq!(
+            alt_modified_key_sequence(egui::Key::Delete, true),
+            Some(b"\x1b[3;4~".to_vec())
+        );
+    }
+
+    // ---- plain-text snapshot rendering ----
+
+    #[test]
+    fn snapshot_to_plain_text_trims_trailing_spaces_per_row() {
+        let snapshot = TerminalSnapshot {
+            rows: vec![
+                vec![plain_span("hello "), plain_span("world   ")],
+                vec![plain_span("  padded  "), plain_span(" ")],
+                vec![plain_span("   ")],
+            ],
+            at_scrollback_top: false,
+        };
+        assert_eq!(snapshot_to_plain_text(&snapshot), "hello world\n  padded\n");
+    }
+
+    #[test]
+    fn snapshot_to_plain_text_empty_snapshot_is_empty_string() {
+        let snapshot = TerminalSnapshot {
+            rows: Vec::new(),
+            at_scrollback_top: false,
+        };
+        assert_eq!(snapshot_to_plain_text(&snapshot), "");
+    }
+
+    // ---- chrome palette ----
+
+    #[test]
+    fn chrome_palette_wires_each_alpha_slot_independently() {
+        // Distinct alphas prove each element reads its own profile slot.
+        let profile = OpacityProfile {
+            desktop_alpha: 1,
+            window_alpha: 2,
+            window_border_alpha: 3,
+            titlebar_alpha: 4,
+            tabbar_alpha: 5,
+            terminal_alpha: 6,
+            terminal_border_alpha: 7,
+            shadow_alpha: 8,
+        };
+        let palette = ChromePalette::from_opacity_profile(profile);
+        assert_eq!(
+            palette.desktop_bg,
+            Color32::from_rgba_unmultiplied(8, 10, 16, 1)
+        );
+        assert_eq!(
+            palette.window_bg,
+            Color32::from_rgba_unmultiplied(13, 16, 24, 2)
+        );
+        assert_eq!(
+            palette.window_border,
+            Color32::from_rgba_unmultiplied(144, 153, 176, 3)
+        );
+        assert_eq!(
+            palette.titlebar_bg,
+            Color32::from_rgba_unmultiplied(24, 28, 39, 4)
+        );
+        assert_eq!(
+            palette.tabbar_bg,
+            Color32::from_rgba_unmultiplied(31, 35, 48, 5)
+        );
+        assert_eq!(
+            palette.terminal_bg,
+            Color32::from_rgba_unmultiplied(8, 11, 18, 6)
+        );
+        assert_eq!(
+            palette.terminal_border,
+            Color32::from_rgba_unmultiplied(108, 118, 146, 7)
+        );
+        assert_eq!(palette.text_primary, Color32::from_rgb(232, 236, 246));
+        assert_eq!(palette.text_muted, Color32::from_rgb(156, 162, 178));
+    }
+
+    #[test]
+    fn chrome_palette_default_matches_native_opacity_profile() {
+        let from_native =
+            ChromePalette::from_opacity_profile(ChromeBridge::default_opacity_profile());
+        let from_default = ChromePalette::default();
+        assert_eq!(from_native.desktop_bg, from_default.desktop_bg);
+        assert_eq!(from_native.window_bg, from_default.window_bg);
+        assert_eq!(from_native.terminal_bg, from_default.terminal_bg);
+    }
+
+    // ---- span to egui text format ----
+
+    #[test]
+    fn append_span_maps_cell_style_to_text_format() {
+        let mut job = egui::text::LayoutJob::default();
+        let span = StyledSpan {
+            text: "hi".to_owned(),
+            style: CellStyle {
+                fg: Color::Rgb(255, 0, 0),
+                bg: Color::Idx(4),
+                bold: false,
+                dim: false,
+                italic: true,
+                underline: true,
+                inverse: false,
+            },
+        };
+        let font_id = egui::FontId::monospace(14.0);
+
+        append_span(&mut job, &span, &font_id, theme_fg(), theme_bg());
+
+        assert_eq!(job.text, "hi");
+        let section = &job.sections[0];
+        assert_eq!(section.format.font_id, font_id);
+        assert_eq!(section.format.color, Color32::from_rgb(255, 0, 0));
+        assert_eq!(section.format.background, Color32::from_rgb(36, 114, 200));
+        assert!(section.format.italics);
+        assert_eq!(
+            section.format.underline,
+            Stroke::new(1.0, Color32::from_rgb(255, 0, 0))
+        );
+    }
+
+    #[test]
+    fn append_span_applies_bold_brightening_and_inverse() {
+        let mut job = egui::text::LayoutJob::default();
+        let font_id = egui::FontId::monospace(14.0);
+
+        let bold_span = StyledSpan {
+            text: "b".to_owned(),
+            style: CellStyle {
+                fg: Color::Rgb(100, 100, 100),
+                bg: Color::Default,
+                bold: true,
+                ..plain_span("x").style
+            },
+        };
+        append_span(&mut job, &bold_span, &font_id, theme_fg(), theme_bg());
+
+        let inverse_span = StyledSpan {
+            text: "i".to_owned(),
+            style: CellStyle {
+                inverse: true,
+                ..plain_span("x").style
+            },
+        };
+        append_span(&mut job, &inverse_span, &font_id, theme_fg(), theme_bg());
+
+        assert_eq!(job.text, "bi");
+        assert_ne!(
+            job.sections[0].format.color,
+            Color32::from_rgb(100, 100, 100),
+            "bold should brighten the foreground"
+        );
+        assert_eq!(job.sections[0].format.background, theme_bg());
+
+        let inverse_section = &job.sections[1];
+        assert_eq!(
+            inverse_section.format.color,
+            theme_bg(),
+            "inverse swaps fg and bg"
+        );
+        assert_eq!(inverse_section.format.background, theme_fg());
+    }
+
+    // ---- app-level state that needs no PTY ----
+
+    #[test]
+    fn error_app_starts_with_no_tabs_and_minimal_grid() {
+        let app = LumiTermApp::error("Boom".to_owned(), "it broke".to_owned());
+
+        assert!(app.tabs.is_empty());
+        assert_eq!(app.status_message.as_deref(), Some("it broke"));
+        assert_eq!(app.session_title, "Lumi-Term");
+        assert_eq!(app.rows, MIN_TERM_ROWS);
+        assert_eq!(app.cols, MIN_TERM_COLS);
+        assert_eq!(app.chrome.active_tab(), 0);
+        assert!(
+            app.active_tab().is_none(),
+            "error app must not expose a terminal tab"
+        );
+    }
+}

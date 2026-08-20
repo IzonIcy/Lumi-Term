@@ -142,4 +142,92 @@ mod tests {
             "unexpected error: {error}"
         );
     }
+
+    #[test]
+    fn rejects_config_missing_required_fields() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("lumi-term.toml");
+        std::fs::write(&path, "window = { title = \"T\" }").expect("write partial config");
+
+        let error =
+            AppConfig::load_or_create_at(&path).expect_err("config missing fields must fail");
+        assert!(
+            error.to_string().contains("parsing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_config_with_wrong_field_types() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("lumi-term.toml");
+        std::fs::write(
+            &path,
+            r#"
+window = { title = 42, width = 100.0, height = 50.0 }
+terminal = { font_size = 12.0, scrollback = 500 }
+theme = { background = [1, 2, 3], foreground = [4, 5, 6] }
+"#,
+        )
+        .expect("write type-mismatched config");
+
+        let error =
+            AppConfig::load_or_create_at(&path).expect_err("type-mismatched config must fail");
+        assert!(
+            error.to_string().contains("parsing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn ignores_unknown_fields() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("lumi-term.toml");
+        std::fs::write(
+            &path,
+            r#"
+window = { title = "T", width = 100.0, height = 50.0, extra_window_key = 1 }
+terminal = { font_size = 12.0, scrollback = 500, shell = "/bin/sh", working_directory = "/tmp", extra_terminal_key = true }
+theme = { background = [1, 2, 3], foreground = [4, 5, 6], extra_theme_key = "x" }
+"#,
+        )
+        .expect("write config with unknown fields");
+
+        let config = AppConfig::load_or_create_at(&path).expect("load config");
+        assert_eq!(config.window.title, "T");
+        assert_eq!(config.terminal.scrollback, 500);
+        assert_eq!(config.terminal.shell.as_deref(), Some("/bin/sh"));
+        assert_eq!(
+            config.terminal.working_directory.as_deref(),
+            Some(std::path::Path::new("/tmp"))
+        );
+        assert_eq!(config.theme.background, [1, 2, 3]);
+    }
+
+    #[test]
+    fn write_to_disk_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join("nested")
+            .join("deeper")
+            .join("lumi-term.toml");
+
+        AppConfig::default()
+            .write_to_disk_at(&path)
+            .expect("write to nested path");
+        assert!(
+            path.exists(),
+            "config should be written into a freshly created directory tree"
+        );
+    }
+
+    #[test]
+    fn config_path_targets_lumi_term_toml() {
+        let path = AppConfig::path().expect("config path");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("lumi-term.toml")
+        );
+    }
 }

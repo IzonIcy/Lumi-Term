@@ -89,3 +89,80 @@ impl ChromeBridge {
         unsafe { lumi_default_opacity_profile() }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ChromeBridge;
+
+    #[test]
+    fn initializes_active_tab_to_zero() {
+        assert_eq!(ChromeBridge::new(4).active_tab(), 0);
+        assert_eq!(ChromeBridge::new(0).active_tab(), 0);
+    }
+
+    #[test]
+    fn active_tab_clamps_to_last_tab_when_out_of_range() {
+        let mut bridge = ChromeBridge::new(3);
+        bridge.set_active_tab(99);
+        assert_eq!(bridge.active_tab(), 2);
+    }
+
+    #[test]
+    fn set_active_tab_is_noop_when_there_are_no_tabs() {
+        let mut bridge = ChromeBridge::new(0);
+        bridge.set_active_tab(2);
+        assert_eq!(bridge.active_tab(), 0);
+    }
+
+    #[test]
+    fn reducing_tab_count_clamps_active_tab() {
+        let mut bridge = ChromeBridge::new(5);
+        bridge.set_active_tab(4);
+        bridge.set_tab_count(3);
+        assert_eq!(bridge.active_tab(), 2);
+    }
+
+    #[test]
+    fn zero_tab_count_resets_active_tab() {
+        let mut bridge = ChromeBridge::new(2);
+        bridge.set_active_tab(1);
+        bridge.set_tab_count(0);
+        assert_eq!(bridge.active_tab(), 0);
+    }
+
+    #[test]
+    fn next_tab_wraps_around_to_first_tab() {
+        let mut bridge = ChromeBridge::new(3);
+        bridge.set_active_tab(2);
+        bridge.next_tab();
+        assert_eq!(bridge.active_tab(), 0);
+    }
+
+    #[test]
+    fn previous_tab_wraps_around_to_last_tab() {
+        let mut bridge = ChromeBridge::new(3);
+        bridge.previous_tab();
+        assert_eq!(bridge.active_tab(), 2);
+    }
+
+    #[test]
+    fn toggle_maximized_flips_window_state() {
+        let mut bridge = ChromeBridge::new(1);
+        assert!(bridge.toggle_maximized());
+        assert!(!bridge.toggle_maximized());
+        assert!(bridge.toggle_maximized());
+    }
+
+    #[test]
+    fn default_opacity_profile_matches_native_defaults() {
+        let profile = ChromeBridge::default_opacity_profile();
+        assert_eq!(profile.desktop_alpha, 0);
+        assert_eq!(profile.window_alpha, 128);
+        assert_eq!(profile.window_border_alpha, 64);
+        assert_eq!(profile.titlebar_alpha, 96);
+        assert_eq!(profile.tabbar_alpha, 108);
+        assert_eq!(profile.terminal_alpha, 76);
+        assert_eq!(profile.terminal_border_alpha, 56);
+        assert_eq!(profile.shadow_alpha, 42);
+    }
+}
