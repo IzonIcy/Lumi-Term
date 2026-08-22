@@ -163,6 +163,57 @@ impl TerminalSession {
         self.parser.screen_mut().set_scrollback(0);
     }
 
+    /// Scroll backwards through the buffer to the nearest line containing
+    /// `query` (case-insensitive). On a hit the screen is left scrolled at the
+    /// match so it stays visible; returns that scrollback offset. Returns None
+    /// (and restores the previous position) when nothing matches.
+    pub fn search_scrollback(&mut self, query: &str) -> Option<usize> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+
+        let screen = self.parser.screen_mut();
+        let original = screen.scrollback();
+        let cols = screen.size().1;
+
+        // Find the top of the scrollback: set_scrollback saturates, so probe
+        // forward in chunks until the requested offset stops being honored.
+        let mut probe = original;
+        loop {
+            probe += 512;
+            screen.set_scrollback(probe);
+            if screen.scrollback() < probe {
+                break;
+            }
+            if probe > 50_000_000 {
+                break; // absurd guard; real buffers never get here
+            }
+        }
+        let top = screen.scrollback();
+
+        // Walk down from the top toward where the user was, first match wins.
+        let mut offset = top;
+        loop {
+            screen.set_scrollback(offset);
+            let haystack: String = screen
+                .rows(0, cols)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .to_lowercase();
+            if haystack.contains(&needle) {
+                return Some(offset);
+            }
+            if offset == 0 || offset <= original {
+                break;
+            }
+            offset -= 1;
+        }
+
+        screen.set_scrollback(original);
+        None
+    }
+
     pub fn send_text(&mut self, text: &str) -> Result<()> {
         self.writer
             .write_all(text.as_bytes())

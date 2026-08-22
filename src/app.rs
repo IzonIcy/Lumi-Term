@@ -6,8 +6,9 @@ use crate::{
 use anyhow::{Context, Result};
 use eframe::egui::{
     self, Align, Button, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, Shadow,
-    Stroke,
+    Stroke, TextEdit, TextStyle,
 };
+use std::path::PathBuf;
 use std::time::Duration;
 use vt100::Color;
 
@@ -88,6 +89,12 @@ pub struct LumiTermApp {
     session_title: String,
     rows: u16,
     cols: u16,
+    search_open: bool,
+    search_query: String,
+    search_field_focused: bool,
+    config_path: Option<PathBuf>,
+    config_mtime: Option<std::time::SystemTime>,
+    last_config_poll: std::time::Instant,
 }
 
 impl LumiTermApp {
@@ -117,6 +124,12 @@ impl LumiTermApp {
             session_title: format_session_title(),
             rows,
             cols,
+            search_open: false,
+            search_query: String::new(),
+            search_field_focused: false,
+            config_path: AppConfig::path().ok(),
+            config_mtime: None,
+            last_config_poll: std::time::Instant::now(),
         })
     }
 
@@ -138,6 +151,12 @@ impl LumiTermApp {
             session_title: "Lumi-Term".to_owned(),
             rows: MIN_TERM_ROWS,
             cols: MIN_TERM_COLS,
+            search_open: false,
+            search_query: String::new(),
+            search_field_focused: false,
+            config_path: None,
+            config_mtime: None,
+            last_config_poll: std::time::Instant::now(),
         }
     }
 
@@ -207,6 +226,9 @@ impl LumiTermApp {
     }
 
     fn ingest_events(&mut self, ctx: &egui::Context) {
+        // While the search field is focused, keystrokes belong to it — don't
+        // also forward them to the PTY.
+        let search_owns_keys = self.search_open && self.search_field_focused;
         let scroll_delta = ctx.input(|input| input.smooth_scroll_delta.y);
         let wheel_lines = (scroll_delta / self.config.terminal.font_size.max(1.0)).round() as i32;
         if wheel_lines != 0
@@ -223,6 +245,9 @@ impl LumiTermApp {
                     self.copy_visible_text(ctx);
                 }
                 egui::Event::Text(text) => {
+                    if search_owns_keys {
+                        continue;
+                    }
                     let filtered: String = text.chars().filter(|char| !char.is_control()).collect();
                     if !filtered.is_empty() {
                         if let Some(tab) = self.active_tab_mut() {
@@ -232,6 +257,9 @@ impl LumiTermApp {
                     }
                 }
                 egui::Event::Paste(text) => {
+                    if search_owns_keys {
+                        continue;
+                    }
                     if let Some(tab) = self.active_tab_mut() {
                         tab.follow_output = true;
                     }
@@ -243,6 +271,15 @@ impl LumiTermApp {
                     modifiers,
                     ..
                 } => {
+                    if key == egui::Key::F && (modifiers.command || modifiers.ctrl) {
+                        self.search_open = !self.search_open;
+                        continue;
+                    }
+
+                    if search_owns_keys {
+                        continue;
+                    }
+
                     if key == egui::Key::PageUp && modifiers.shift {
                         if let Some(tab) = self.active_tab_mut() {
                             tab.session.scroll_by_lines(10);
@@ -518,6 +555,98 @@ impl LumiTermApp {
             });
     }
 
+    /// Re-reads the config file when it changed on disk (polled every 2s).
+    /// A malformed edit keeps the last good config; the change is picked up
+    /// on the next successful parse.
+    fn poll_config_reload(&mut self) {
+        if self.last_config_poll.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_config_poll = std::time::Instant::now();
+
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        let mtime = std::fs::metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok());
+        if mtime == self.config_mtime {
+            return;
+        }
+        self.config_mtime = mtime;
+
+        match AppConfig::load_or_create_at(path) {
+            Ok(fresh) => {
+                self.config = fresh;
+                self.status_message = Some("Config reloaded.".to_owned());
+            }
+            Err(_) => {
+                // keep running with the previous config; try again next edit
+                self.status_message =
+                    Some("Config has errors — still using last good values.".to_owned());
+            }
+        }
+    }
+
+    /// Runs a scrollback search on the active tab, leaving the view at the
+    /// nearest match at or above the current position.
+    fn run_search(&mut self) -> Option<usize> {
+        let query = self.search_query.clone();
+        let tab = self.active_tab_mut()?;
+        let hit = tab.session.search_scrollback(&query);
+        if hit.is_some() {
+            tab.follow_output = false;
+            tab.snapshot = tab.session.snapshot();
+        }
+        hit
+    }
+
+    fn draw_search_bar(&mut self, ui: &mut egui::Ui) {
+        if !self.search_open {
+            self.search_field_focused = false;
+            return;
+        }
+
+        Frame::new()
+            .fill(Color32::from_rgba_unmultiplied(24, 26, 30, 240))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(60, 64, 70)))
+            .inner_margin(Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        TextEdit::singleline(&mut self.search_query)
+                            .hint_text("Search scrollback (Enter)")
+                            .desired_width(260.0)
+                            .font(TextStyle::Monospace),
+                    );
+                    self.search_field_focused = response.has_focus();
+
+                    if ui.button("Find").clicked()
+                        || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    {
+                        match self.run_search() {
+                            Some(offset) => {
+                                self.status_message =
+                                    Some(format!("Match found at scrollback +{offset}."));
+                            }
+                            None => {
+                                self.status_message = Some("No matches in scrollback.".to_owned());
+                            }
+                        }
+                        response.request_focus();
+                    }
+
+                    if ui.button("Close").clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        self.search_open = false;
+                        self.search_query.clear();
+                        self.search_field_focused = false;
+                    }
+                });
+            });
+    }
+
     fn copy_visible_text(&self, ctx: &egui::Context) {
         if let Some(tab) = self.active_tab() {
             let text = snapshot_to_plain_text(&tab.snapshot);
@@ -530,6 +659,7 @@ impl eframe::App for LumiTermApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.ingest_events(&ctx);
+        self.poll_config_reload();
 
         if let Some(tab) = self.active_tab_mut() {
             let has_updates = tab.session.poll_output();
@@ -566,6 +696,9 @@ impl eframe::App for LumiTermApp {
             .show(ui, |ui| {
                 self.draw_titlebar(ui, palette, &ctx);
                 self.draw_tabbar(ui, palette);
+                if self.search_open {
+                    self.draw_search_bar(ui);
+                }
                 self.draw_terminal_surface(ui, palette, &ctx);
 
                 if let Some(status) = &self.status_message {
