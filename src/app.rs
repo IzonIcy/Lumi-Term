@@ -49,6 +49,44 @@ struct TerminalTab {
     session_closed: bool,
 }
 
+/// Outcome of checking the config file for a hot-reload.
+enum ConfigReload {
+    /// File unchanged since the last poll — nothing to do.
+    Unchanged,
+    /// File changed and parsed cleanly; carry the fresh config and its mtime.
+    Reloaded(AppConfig, Option<std::time::SystemTime>),
+    /// File changed but does not parse; keep the last good config. The mtime
+    /// is still recorded so we don't re-parse the same broken file every 2s.
+    Invalid(Option<std::time::SystemTime>),
+}
+
+fn current_config_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+}
+
+fn poll_config_change(
+    path: &std::path::Path,
+    last_mtime: Option<std::time::SystemTime>,
+) -> ConfigReload {
+    let mtime = current_config_mtime(path);
+    if mtime == last_mtime {
+        return ConfigReload::Unchanged;
+    }
+    // Startup creates a default config when none exists, but a *deleted*
+    // config mid-session must not: load_or_create_at would silently write
+    // factory defaults over nothing, discarding the user's settings. Keep
+    // the last good values instead.
+    if !path.exists() {
+        return ConfigReload::Invalid(mtime);
+    }
+    match AppConfig::load_or_create_at(path) {
+        Ok(fresh) => ConfigReload::Reloaded(fresh, mtime),
+        Err(_) => ConfigReload::Invalid(mtime),
+    }
+}
+
 impl Default for ChromePalette {
     fn default() -> Self {
         Self::from_opacity_profile(ChromeBridge::default_opacity_profile())
@@ -564,24 +602,20 @@ impl LumiTermApp {
         }
         self.last_config_poll = std::time::Instant::now();
 
-        let Some(path) = &self.config_path else {
+        let Some(path) = self.config_path.clone() else {
             return;
         };
-        let mtime = std::fs::metadata(path)
-            .ok()
-            .and_then(|meta| meta.modified().ok());
-        if mtime == self.config_mtime {
-            return;
-        }
-        self.config_mtime = mtime;
 
-        match AppConfig::load_or_create_at(path) {
-            Ok(fresh) => {
+        match poll_config_change(&path, self.config_mtime) {
+            ConfigReload::Unchanged => {}
+            ConfigReload::Reloaded(fresh, mtime) => {
+                self.config_mtime = mtime;
                 self.config = fresh;
                 self.status_message = Some("Config reloaded.".to_owned());
             }
-            Err(_) => {
-                // keep running with the previous config; try again next edit
+            // Keep running with the previous config; try again next edit.
+            ConfigReload::Invalid(mtime) => {
+                self.config_mtime = mtime;
                 self.status_message =
                     Some("Config has errors — still using last good values.".to_owned());
             }
@@ -1062,6 +1096,109 @@ fn format_session_title() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_reload_unchanged_when_mtime_matches() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("lumi-term.toml");
+        std::fs::write(
+            &path,
+            toml::to_string_pretty(&AppConfig::default()).expect("serialize"),
+        )
+        .expect("write config");
+
+        let mtime = current_config_mtime(&path);
+        assert!(mtime.is_some(), "written file should have an mtime");
+
+        match poll_config_change(&path, mtime) {
+            ConfigReload::Unchanged => {}
+            _ => panic!("identical mtime must be treated as Unchanged"),
+        }
+    }
+
+    #[test]
+    fn config_reload_reloads_valid_changes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("lumi-term.toml");
+        std::fs::write(
+            &path,
+            r#"
+window = { title = "First", width = 100.0, height = 50.0 }
+terminal = { font_size = 12.0, scrollback = 500 }
+theme = { background = [1, 2, 3], foreground = [4, 5, 6] }
+"#,
+        )
+        .expect("write config");
+        let old_mtime = current_config_mtime(&path);
+
+        // Give the filesystem a new mtime for the edit.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            &path,
+            r#"
+window = { title = "Second", width = 200.0, height = 80.0 }
+terminal = { font_size = 14.0, scrollback = 2_000 }
+theme = { background = [9, 9, 9], foreground = [240, 240, 240] }
+"#,
+        )
+        .expect("rewrite config");
+
+        match poll_config_change(&path, old_mtime) {
+            ConfigReload::Reloaded(config, _) => {
+                assert_eq!(config.window.title, "Second");
+                assert_eq!(config.terminal.scrollback, 2_000);
+            }
+            _ => panic!("a valid edited config must reload"),
+        }
+    }
+
+    #[test]
+    fn config_reload_reports_invalid_edit_without_crashing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("lumi-term.toml");
+        std::fs::write(
+            &path,
+            toml::to_string_pretty(&AppConfig::default()).expect("serialize"),
+        )
+        .expect("write good config first");
+        let good_mtime = current_config_mtime(&path);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "terminal = { scrollback = }").expect("write broken config");
+
+        // A mid-edit broken file must surface as Invalid (keep last good
+        // config), never as a crash or a silent Unchanged.
+        match poll_config_change(&path, good_mtime) {
+            ConfigReload::Invalid(_) => {}
+            ConfigReload::Reloaded(_, _) => panic!("broken config must not parse"),
+            ConfigReload::Unchanged => panic!("changed file must not be reported unchanged"),
+        }
+
+        // And the same broken file on the next poll is correctly skipped.
+        let bad_mtime = current_config_mtime(&path);
+        assert!(matches!(
+            poll_config_change(&path, bad_mtime),
+            ConfigReload::Unchanged
+        ));
+    }
+
+    #[test]
+    fn config_reload_treats_missing_file_as_invalid_not_fatal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("deleted-mid-session.toml");
+        std::fs::write(
+            &path,
+            toml::to_string_pretty(&AppConfig::default()).expect("s"),
+        )
+        .expect("write config");
+        let mtime = current_config_mtime(&path);
+        std::fs::remove_file(&path).expect("delete config");
+
+        match poll_config_change(&path, mtime) {
+            ConfigReload::Invalid(None) => {}
+            _ => panic!("a deleted config must keep the last good values"),
+        }
+    }
 
     fn plain_span(text: &str) -> StyledSpan {
         StyledSpan {
