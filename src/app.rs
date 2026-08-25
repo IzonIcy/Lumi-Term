@@ -51,7 +51,7 @@ struct TerminalTab {
 
 /// Outcome of checking the config file for a hot-reload.
 enum ConfigReload {
-    /// File unchanged since the last poll — nothing to do.
+    /// File unchanged since the last poll; nothing to do.
     Unchanged,
     /// File changed and parsed cleanly; carry the fresh config and its mtime.
     Reloaded(AppConfig, Option<std::time::SystemTime>),
@@ -264,7 +264,7 @@ impl LumiTermApp {
     }
 
     fn ingest_events(&mut self, ctx: &egui::Context) {
-        // While the search field is focused, keystrokes belong to it — don't
+        // While the search field is focused, keystrokes belong to it; don't
         // also forward them to the PTY.
         let search_owns_keys = self.search_open && self.search_field_focused;
         let scroll_delta = ctx.input(|input| input.smooth_scroll_delta.y);

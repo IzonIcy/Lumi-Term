@@ -163,10 +163,9 @@ impl TerminalSession {
         self.parser.screen_mut().set_scrollback(0);
     }
 
-    /// Scroll backwards through the buffer to the nearest line containing
-    /// `query` (case-insensitive). On a hit the screen is left scrolled at the
-    /// match so it stays visible; returns that scrollback offset. Returns None
-    /// (and restores the previous position) when nothing matches.
+    /// Scrolls back to the nearest line containing `query` (case-insensitive),
+    /// leaving it on screen; returns its scrollback offset, or None (position
+    /// restored) when nothing matches.
     pub fn search_scrollback(&mut self, query: &str) -> Option<usize> {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
@@ -235,10 +234,8 @@ impl TerminalSession {
     }
 }
 
-/// Converts the current vt100 screen state into coalesced styled spans.
-///
-/// Pure function of the parser state so rendering logic can be unit-tested
-/// without a live PTY.
+/// Converts the current vt100 screen state into coalesced styled spans; pure
+/// so rendering logic can be unit-tested without a live PTY.
 pub fn screen_to_snapshot(parser: &Parser) -> TerminalSnapshot {
     let screen = parser.screen();
     let (rows, cols) = screen.size();
@@ -468,7 +465,7 @@ mod tests {
 
     #[test]
     fn sgr_intensity_is_a_single_axis_with_last_one_wins() {
-        // Bold (1) and dim (2) share one intensity field in vt100 — they are
+        // Bold (1) and dim (2) share one intensity field in vt100; they are
         // mutually exclusive, and the later sequence replaces the earlier.
         let parser = parse_with_size(1, 12, "\x1b[1mA\x1b[2mB\x1b[1mC");
         let snapshot = screen_to_snapshot(&parser);
