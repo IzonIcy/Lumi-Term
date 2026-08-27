@@ -327,7 +327,10 @@ impl LumiTermApp {
                         if let Some(tab) = self.active_tab_mut() {
                             tab.follow_output = true;
                         }
-                        self.send_text(&filtered);
+                        // Bracketed paste mode: wrap with ESC[200~ ... ESC[201~
+                        // This lets the shell distinguish pasted text from typed input.
+                        let bracketed = format!("\x1b[200~{}\x1b[201~", filtered);
+                        self.send_text(&bracketed);
                     }
                 }
                 egui::Event::Key {

@@ -75,7 +75,14 @@ impl TerminalSession {
             .master
             .try_clone_reader()
             .context("cloning PTY reader")?;
-        let writer = pty_pair.master.take_writer().context("taking PTY writer")?;
+        let mut writer = pty_pair.master.take_writer().context("taking PTY writer")?;
+
+        // Enable bracketed paste mode (ESC[?2004h) so pasted text is wrapped
+        // with ESC[200~ ... ESC[201~. This lets the shell distinguish pasted
+        // input from typed input. Best-effort; some shells may not support it.
+        let _ = writer.write_all(b"\x1b[?2004h");
+        let _ = writer.flush();
+
         let (output_tx, output_rx) = mpsc::channel();
 
         thread::Builder::new()
@@ -147,6 +154,10 @@ impl TerminalSession {
     /// Kills the shell and waits for it. Called when a tab is closed while
     /// its session is still running.
     pub fn shutdown(&mut self) {
+        // Disable bracketed paste mode (ESC[?2004l) on clean shutdown.
+        let _ = self.writer.write_all(b"\x1b[?2004l");
+        let _ = self.writer.flush();
+
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             thread::Builder::new()
