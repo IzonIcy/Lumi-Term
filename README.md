@@ -8,10 +8,10 @@ I wanted to understand how terminals actually work — the whole stack from keys
 ## How it works
 
 ```
-PTY process ──→ Rust core (VT parsing, screen state) ──→ C FFI bridge ──→ GPU render
+PTY process ──→ Rust core (VT parsing, screen state) ──→ egui rendering (C FFI bridge supplies tab/window chrome state)
 ```
 
-The PTY spawns whatever shell you have set, reads its output, parses escape sequences into screen state, and renders damage regions through a C bridge that talks to the GPU. The C code gets compiled at build time by Rust's build script.
+The PTY spawns whatever shell you have set, reads its output, and parses escape sequences into screen state that egui renders. A small C bridge carries tab/window chrome state across the FFI boundary; it's compiled at build time by Rust's build script.
 
 ## Run it
 
@@ -21,12 +21,17 @@ cargo run
 
 Opens a terminal window connected to your default shell.
 
+## Run it
+
+- `Cmd+Ctrl+F` opens scrollback search, `Cmd+T` opens a new tab,
+  `Cmd+Shift+W` closes the active tab.
+
 ## Config
 
 On first launch it creates a TOML config at:
 
 - macOS: `~/Library/Application Support/com.lumi.lumi-term/lumi-term.toml`
-- Linux: `~/.config/lumi/lumi-term/lumi-term.toml`
+- Linux: `$XDG_CONFIG_HOME/lumi-term/lumi-term.toml`
 
 ```toml
 [window]
@@ -50,12 +55,12 @@ foreground = [233, 233, 233]
 src/
 ├── main.rs           # entry point
 ├── app.rs            # event loop, frame timing
-├── pty.rs            # PTY spawn, I/O, signals
+├── pty.rs            # PTY spawn, I/O, session lifecycle
 ├── config.rs         # TOML loading
 └── chrome_bridge.rs  # C FFI declarations
 
 native/
-├── lumi_chrome.c     # GPU rendering
+├── lumi_chrome.c     # tab/window chrome state bridge
 └── lumi_chrome.h
 ```
 

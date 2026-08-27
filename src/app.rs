@@ -221,6 +221,20 @@ impl LumiTermApp {
         }
     }
 
+    /// Closes the active tab and kills its session. The last tab stays:
+    /// closing it would leave a window with nothing to show.
+    fn close_active_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        let active = self.chrome.active_tab();
+        let mut tab = self.tabs.remove(active);
+        tab.session.shutdown();
+        self.chrome.set_tab_count(self.tabs.len());
+        let next = active.min(self.tabs.len() - 1);
+        self.chrome.set_active_tab(next);
+    }
+
     fn build_tab(&self, title: impl Into<String>) -> Result<TerminalTab> {
         let session = TerminalSession::new(self.rows, self.cols, &self.config.terminal)
             .context("creating terminal session")?;
@@ -298,10 +312,23 @@ impl LumiTermApp {
                     if search_owns_keys {
                         continue;
                     }
-                    if let Some(tab) = self.active_tab_mut() {
-                        tab.follow_output = true;
+                    // Strip C0 control bytes from pasted text but keep line
+                    // structure: \n becomes \r because shells in raw mode
+                    // expect CR as the Enter key.
+                    let filtered: String = text
+                        .chars()
+                        .filter(|char| !char.is_control() || matches!(char, '\n' | '\r' | '\t'))
+                        .map(|char| match char {
+                            '\n' => '\r',
+                            other => other,
+                        })
+                        .collect();
+                    if !filtered.is_empty() {
+                        if let Some(tab) = self.active_tab_mut() {
+                            tab.follow_output = true;
+                        }
+                        self.send_text(&filtered);
                     }
-                    self.send_text(&text);
                 }
                 egui::Event::Key {
                     key,
@@ -311,6 +338,14 @@ impl LumiTermApp {
                 } => {
                     if key == egui::Key::F && (modifiers.command || modifiers.ctrl) {
                         self.search_open = !self.search_open;
+                        continue;
+                    }
+                    if key == egui::Key::W && modifiers.command && modifiers.shift {
+                        self.close_active_tab();
+                        continue;
+                    }
+                    if key == egui::Key::T && modifiers.command {
+                        self.create_tab("Shell");
                         continue;
                     }
 
@@ -708,6 +743,16 @@ impl eframe::App for LumiTermApp {
                 tab.session_closed = true;
                 tab.follow_output = false;
                 self.status_message = Some("Session ended. Restart to continue.".to_owned());
+            }
+        }
+
+        // Background tabs must keep draining their PTYs or an output-heavy
+        // job in a hidden tab buffers unbounded bytes in the channel. Their
+        // snapshots stay stale until focused, which is the documented trade.
+        let active = self.chrome.active_tab();
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if index != active {
+                tab.session.poll_output();
             }
         }
 

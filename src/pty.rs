@@ -37,8 +37,9 @@ pub struct TerminalSession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     output_rx: Receiver<Vec<u8>>,
-    _child: Box<dyn portable_pty::Child + Send>,
+    child: Option<Box<dyn portable_pty::Child + Send>>,
     closed: bool,
+    reaped: bool,
 }
 
 impl TerminalSession {
@@ -107,8 +108,9 @@ impl TerminalSession {
             master: pty_pair.master,
             writer,
             output_rx,
-            _child: child,
+            child: Some(child),
             closed: false,
+            reaped: false,
         })
     }
 
@@ -123,7 +125,39 @@ impl TerminalSession {
             self.parser.process(&bytes);
             has_updates = true;
         }
+        if self.closed && !self.reaped {
+            // Without this wait the shell's PID lingers as a zombie for the
+            // life of the app. Waiting can block briefly, so it happens on a
+            // throwaway thread.
+            self.reaped = true;
+            if let Some(mut child) = self.child.take() {
+                let mut killer = child.clone_killer();
+                let _ = killer.kill();
+                thread::Builder::new()
+                    .name("lumi-term-pty-reaper".to_string())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    })
+                    .ok();
+            }
+        }
         has_updates
+    }
+
+    /// Kills the shell and waits for it. Called when a tab is closed while
+    /// its session is still running.
+    pub fn shutdown(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            thread::Builder::new()
+                .name("lumi-term-pty-reaper".to_string())
+                .spawn(move || {
+                    let _ = child.wait();
+                })
+                .ok();
+        }
+        self.closed = true;
+        self.reaped = true;
     }
 
     pub fn is_closed(&self) -> bool {
