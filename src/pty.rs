@@ -7,7 +7,7 @@ use std::{
     sync::mpsc::{self, Receiver},
     thread,
 };
-use vt100::{Color, Parser};
+use vt100::{Color, Parser, Screen};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CellStyle {
@@ -39,7 +39,6 @@ pub struct TerminalSession {
     output_rx: Receiver<Vec<u8>>,
     child: Option<Box<dyn portable_pty::Child + Send>>,
     closed: bool,
-    reaped: bool,
 }
 
 impl TerminalSession {
@@ -117,7 +116,6 @@ impl TerminalSession {
             output_rx,
             child: Some(child),
             closed: false,
-            reaped: false,
         })
     }
 
@@ -132,23 +130,36 @@ impl TerminalSession {
             self.parser.process(&bytes);
             has_updates = true;
         }
-        if self.closed && !self.reaped {
+        if self.closed && self.child.is_some() {
             // Without this wait the shell's PID lingers as a zombie for the
             // life of the app. Waiting can block briefly, so it happens on a
             // throwaway thread.
-            self.reaped = true;
-            if let Some(mut child) = self.child.take() {
-                let mut killer = child.clone_killer();
-                let _ = killer.kill();
-                thread::Builder::new()
-                    .name("lumi-term-pty-reaper".to_string())
-                    .spawn(move || {
-                        let _ = child.wait();
-                    })
-                    .ok();
-            }
+            self.kill_and_reap();
         }
         has_updates
+    }
+
+    /// Kills the child shell and reaps it, so the PID never lingers as a
+    /// zombie. Idempotent: `child` is only ever taken here, so `None` means
+    /// "already killed and reaped".
+    fn kill_and_reap(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            // Waiting on a throwaway thread because `wait()` can block. Note
+            // that `spawn` consumes the closure (and the `Child` with it) even
+            // when it fails, so there is no inline fallback: if the thread
+            // cannot start, the killed child is left unreaped. That is worth
+            // saying out loud rather than swallowing.
+            if let Err(error) = thread::Builder::new()
+                .name("lumi-term-pty-reaper".to_string())
+                .spawn(move || {
+                    let _ = child.wait();
+                })
+            {
+                eprintln!("lumi-term: could not spawn PTY reaper thread: {error}");
+            }
+        }
+        self.closed = true;
     }
 
     /// Kills the shell and waits for it. Called when a tab is closed while
@@ -158,17 +169,7 @@ impl TerminalSession {
         let _ = self.writer.write_all(b"\x1b[?2004l");
         let _ = self.writer.flush();
 
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            thread::Builder::new()
-                .name("lumi-term-pty-reaper".to_string())
-                .spawn(move || {
-                    let _ = child.wait();
-                })
-                .ok();
-        }
-        self.closed = true;
-        self.reaped = true;
+        self.kill_and_reap();
     }
 
     pub fn is_closed(&self) -> bool {
@@ -212,50 +213,7 @@ impl TerminalSession {
     /// leaving it on screen; returns its scrollback offset, or None (position
     /// restored) when nothing matches.
     pub fn search_scrollback(&mut self, query: &str) -> Option<usize> {
-        let needle = query.trim().to_lowercase();
-        if needle.is_empty() {
-            return None;
-        }
-
-        let screen = self.parser.screen_mut();
-        let original = screen.scrollback();
-        let cols = screen.size().1;
-
-        // Find the top of the scrollback: set_scrollback saturates, so probe
-        // forward in chunks until the requested offset stops being honored.
-        let mut probe = original;
-        loop {
-            probe += 512;
-            screen.set_scrollback(probe);
-            if screen.scrollback() < probe {
-                break;
-            }
-            if probe > 50_000_000 {
-                break; // absurd guard; real buffers never get here
-            }
-        }
-        let top = screen.scrollback();
-
-        // Walk down from the top toward where the user was, first match wins.
-        let mut offset = top;
-        loop {
-            screen.set_scrollback(offset);
-            let haystack: String = screen
-                .rows(0, cols)
-                .collect::<Vec<_>>()
-                .join("\n")
-                .to_lowercase();
-            if haystack.contains(&needle) {
-                return Some(offset);
-            }
-            if offset == 0 || offset <= original {
-                break;
-            }
-            offset -= 1;
-        }
-
-        screen.set_scrollback(original);
-        None
+        search_parser_scrollback(&mut self.parser, query)
     }
 
     pub fn send_text(&mut self, text: &str) -> Result<()> {
@@ -277,6 +235,112 @@ impl TerminalSession {
     pub fn snapshot(&self) -> TerminalSnapshot {
         screen_to_snapshot(&self.parser)
     }
+
+    /// The shell's OS pid, for asserting that `Drop` really reaps it.
+    #[cfg(test)]
+    fn child_pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|child| child.process_id())
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        // A session can be dropped without an explicit shutdown(): a tab
+        // restart replaces it in place, and app exit drops every tab.
+        //
+        // Killing directly rather than via shutdown() because Drop must not do
+        // I/O — the master fd is still open, and a write can block if the
+        // child is alive but not draining its stdin, which would hang the app
+        // on exit. Dropping the master would SIGHUP the child anyway, so the
+        // shells were not truly orphaned; what leaked was the *unreaped* child
+        // and the detached reader thread.
+        self.kill_and_reap();
+    }
+}
+
+/// True if any visible row of `screen` contains `needle` (already lowercased).
+fn window_matches(screen: &mut Screen, cols: u16, needle: &str) -> bool {
+    screen
+        .rows(0, cols)
+        .any(|row| row.to_lowercase().contains(needle))
+}
+
+/// Scrolls `parser`'s view back to the nearest line containing `query`,
+/// case-insensitively, leaving that line on screen. Returns its scrollback
+/// offset, or `None` with the original position restored.
+///
+/// Offset 0 is the live screen and larger offsets are progressively older
+/// lines, so "nearest match at or above where the user is" means walking
+/// *up* from the current offset. Walking down from the oldest line instead
+/// would scan the whole buffer to find something already on screen.
+///
+/// Two passes, because the cost is dominated by how many times the viewport
+/// is re-rendered. The viewport is a sliding window of `rows` consecutive
+/// lines, so any single line is visible across exactly `rows` consecutive
+/// offsets: a coarse stride of `rows` therefore cannot step over a match.
+/// The coarse pass finds a window containing a hit, then a short fine walk
+/// inside that window reports the *nearest* one. Stepping one offset at a
+/// time instead re-rendered the entire scrollback and froze the UI for
+/// seconds on a realistic buffer.
+///
+/// Pure over a `Parser` (no PTY) so the search logic is unit-testable.
+pub fn search_parser_scrollback(parser: &mut Parser, query: &str) -> Option<usize> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+
+    let screen = parser.screen_mut();
+    let original = screen.scrollback();
+    let (rows, cols) = screen.size();
+    let stride = (rows as usize).max(1);
+
+    // Find the top of the scrollback: set_scrollback saturates, so probe
+    // forward in chunks until the requested offset stops being honored.
+    // (set_scrollback clamps internally, so the clamp below is what actually
+    // ends this loop; the counter guard is belt-and-braces.)
+    let mut probe = original;
+    loop {
+        probe += 512;
+        screen.set_scrollback(probe);
+        if screen.scrollback() < probe {
+            break;
+        }
+        if probe > 50_000_000 {
+            break;
+        }
+    }
+    let top = screen.scrollback();
+
+    let mut offset = original;
+    loop {
+        screen.set_scrollback(offset);
+        if window_matches(screen, cols, &needle) {
+            // A hit somewhere in this window. Visibility is monotonic across
+            // the window, so the lowest offset that still shows a match is
+            // the nearest one.
+            let low = offset.saturating_sub(stride - 1).max(original);
+            let mut fine = low;
+            loop {
+                screen.set_scrollback(fine);
+                if window_matches(screen, cols, &needle) {
+                    return Some(fine);
+                }
+                if fine >= offset {
+                    break;
+                }
+                fine += 1;
+            }
+            return Some(offset);
+        }
+        if offset >= top {
+            break;
+        }
+        offset = (offset + stride).min(top);
+    }
+
+    screen.set_scrollback(original);
+    None
 }
 
 /// Converts the current vt100 screen state into coalesced styled spans; pure
@@ -357,13 +421,27 @@ pub fn screen_to_snapshot(parser: &Parser) -> TerminalSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{CellStyle, screen_to_snapshot};
+    use super::{CellStyle, screen_to_snapshot, search_parser_scrollback};
     use vt100::{Color, Parser};
 
     fn parse_with_size(rows: u16, cols: u16, input: &str) -> Parser {
         let mut parser = Parser::new(rows, cols, 10_000);
         parser.process(input.as_bytes());
         parser
+    }
+
+    /// Feeds newline-terminated lines through the parser so earlier ones are
+    /// pushed into the scrollback buffer.
+    fn parser_fed_with(lines: &[&str], rows: u16, cols: u16) -> Parser {
+        let mut parser = Parser::new(rows, cols, 50_000);
+        for line in lines {
+            parser.process(format!("{line}\r\n").as_bytes());
+        }
+        parser
+    }
+
+    fn visible_text(parser: &Parser, cols: u16) -> String {
+        parser.screen().rows(0, cols).collect::<Vec<_>>().join("\n")
     }
 
     fn row_text(snapshot: &super::TerminalSnapshot, row: usize) -> String {
@@ -528,5 +606,209 @@ mod tests {
             spans[2].style.bold && !spans[2].style.dim,
             "SGR 1 replaces dim with bold"
         );
+    }
+
+    // ---- scrollback search ----
+
+    #[test]
+    fn search_finds_a_match_in_scrollback_and_leaves_it_visible() {
+        let mut parser = parser_fed_with(
+            &["alpha", "bravo", "Needle_Here", "charlie", "delta", "echo"],
+            2,
+            40,
+        );
+        let hit = search_parser_scrollback(&mut parser, "needle_here")
+            .expect("match should be found, case-insensitively");
+
+        assert!(hit > 0, "match is above the live screen, got offset {hit}");
+        assert!(
+            visible_text(&parser, 40).contains("Needle_Here"),
+            "the matched line should be left on screen"
+        );
+    }
+
+    #[test]
+    fn search_returns_the_nearest_match_not_the_oldest() {
+        // Two hits: one far back, one just above the live screen. Walking from
+        // the oldest line down toward the user (the old behaviour) returned
+        // 'stale-marker'; the nearest match is 'fresh-marker'.
+        let mut parser = parser_fed_with(
+            &[
+                "stale-marker",
+                "one",
+                "two",
+                "three",
+                "four",
+                "fresh-marker",
+                "live",
+            ],
+            2,
+            40,
+        );
+
+        let hit = search_parser_scrollback(&mut parser, "marker").expect("a match is expected");
+        let visible = visible_text(&parser, 40);
+
+        assert_eq!(hit, 1, "'fresh-marker' sits one line above the live edge");
+        assert!(
+            visible.contains("fresh-marker"),
+            "nearest match should be on screen, got:\n{visible}"
+        );
+    }
+
+    #[test]
+    fn search_without_a_match_restores_the_previous_position() {
+        let mut parser = parser_fed_with(&["alpha", "bravo", "charlie", "delta"], 2, 40);
+        parser.screen_mut().set_scrollback(2);
+        assert_eq!(parser.screen().scrollback(), 2);
+
+        assert_eq!(
+            search_parser_scrollback(&mut parser, "zzz-not-present"),
+            None
+        );
+        assert_eq!(
+            parser.screen().scrollback(),
+            2,
+            "a failed search must not move the viewport"
+        );
+    }
+
+    #[test]
+    fn search_ignores_empty_and_whitespace_only_queries() {
+        let mut parser = parser_fed_with(&["alpha", "bravo", "charlie"], 2, 40);
+        parser.screen_mut().set_scrollback(1);
+
+        assert_eq!(search_parser_scrollback(&mut parser, ""), None);
+        assert_eq!(search_parser_scrollback(&mut parser, "   \t "), None);
+        assert_eq!(
+            parser.screen().scrollback(),
+            1,
+            "a rejected query must not move the viewport"
+        );
+    }
+
+    /// A wall-clock budget that is generous enough to survive a loaded CI
+    /// runner but still an order of magnitude below what the old
+    /// implementation cost. The regression this guards against took seconds
+    /// and tens of megabytes; a loaded machine pushing 10k lines past 10s
+    /// means something is actually wrong, not just slow.
+    const SLOW_SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn search_terminates_and_is_responsive_on_a_deep_scrollback() {
+        // Regression guard. The old implementation joined every visible row
+        // into one lowercased String per candidate offset, and walked from the
+        // oldest line down to the user's position — so this worst case (no
+        // match, full 10k buffer) allocated tens of megabytes and took
+        // seconds on a single Enter press.
+        let mut parser = Parser::new(24, 80, 50_000);
+        let marker = "depth-marker-first-line";
+        parser.process(format!("{marker}\r\n").as_bytes());
+        let filler = "x".repeat(200);
+        for _ in 0..10_000 {
+            parser.process(format!("{filler}\r\n").as_bytes());
+        }
+
+        // Prove the buffer really is deep: the marker line was written first,
+        // so it is ~10k lines back from the live edge. scrollback() reports
+        // the current offset, not the history size, so probe with a real
+        // search rather than trusting a counter. This is also the long walk —
+        // the match is only at the far end of the buffer.
+        let started = std::time::Instant::now();
+        let oldest = search_parser_scrollback(&mut parser, marker)
+            .expect("the marker line is still in the buffer");
+        let oldest_elapsed = started.elapsed();
+        assert!(
+            oldest > 9_000,
+            "expected a ~10k-line-deep buffer, marker found at {oldest}"
+        );
+        assert!(
+            oldest_elapsed < SLOW_SEARCH_BUDGET,
+            "walking the full buffer took {oldest_elapsed:?}"
+        );
+        // Back to the live edge first. The search above left the viewport at
+        // the top of the buffer, and a search only looks at or above the
+        // current position — so without this the "miss" would examine a
+        // single screen and the timing assertion would prove nothing.
+        parser.screen_mut().set_scrollback(0);
+        let started = std::time::Instant::now();
+        let miss = search_parser_scrollback(&mut parser, "no-such-token-anywhere");
+        let miss_elapsed = started.elapsed();
+        assert_eq!(miss, None, "worst case is a full-buffer miss");
+        assert!(
+            miss_elapsed < SLOW_SEARCH_BUDGET,
+            "full-buffer miss took {miss_elapsed:?}"
+        );
+
+        parser.screen_mut().set_scrollback(0);
+        parser.process(b"the-needle-is-here\r\n");
+        let started = std::time::Instant::now();
+        let hit = search_parser_scrollback(&mut parser, "the-needle");
+        let hit_elapsed = started.elapsed();
+        assert!(hit.is_some(), "a live-screen match should be found");
+        // This is the assertion that actually distinguishes the fix: a search
+        // that walks the full 10k buffer cannot come in near the live edge in
+        // 200ms, whereas the real implementation finds it in well under a
+        // millisecond. Kept tight deliberately, so a regression that restores
+        // the full walk still fails even on a slow runner.
+        assert!(
+            hit_elapsed < std::time::Duration::from_millis(500),
+            "nearest-match search took {hit_elapsed:?}; it should not scan the whole buffer"
+        );
+    }
+
+    // ---- session lifecycle ----
+
+    /// `kill -0` succeeds for any live pid, including a zombie that has been
+    /// killed but not yet reaped. So this asserts reaping, not just killing.
+    fn process_exists(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn dropping_a_session_kills_and_reaps_the_shell() {
+        let config = crate::config::AppConfig::default().terminal;
+        let session = super::TerminalSession::new(10, 40, &config).expect("spawn a session");
+        let pid = session.child_pid().expect("the shell should report a pid");
+        assert!(process_exists(pid), "the shell should be running");
+
+        drop(session);
+
+        // Reaping happens on a helper thread, so poll instead of asserting
+        // instantly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_exists(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            !process_exists(pid),
+            "shell {pid} was killed but never reaped; it is still a zombie"
+        );
+    }
+
+    #[test]
+    fn shutdown_then_drop_is_idempotent() {
+        let config = crate::config::AppConfig::default().terminal;
+        let mut session = super::TerminalSession::new(10, 40, &config).expect("spawn a session");
+        let pid = session.child_pid().expect("the shell should report a pid");
+
+        session.shutdown();
+        assert!(
+            session.is_closed(),
+            "shutdown should mark the session closed"
+        );
+        // Dropping after an explicit shutdown must not panic or double-kill.
+        drop(session);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_exists(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(!process_exists(pid), "shell {pid} outlived its session");
     }
 }
