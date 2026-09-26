@@ -130,6 +130,7 @@ pub struct LumiTermApp {
     search_open: bool,
     search_query: String,
     search_field_focused: bool,
+    search_needs_focus: bool,
     config_path: Option<PathBuf>,
     config_mtime: Option<std::time::SystemTime>,
     last_config_poll: std::time::Instant,
@@ -165,6 +166,7 @@ impl LumiTermApp {
             search_open: false,
             search_query: String::new(),
             search_field_focused: false,
+            search_needs_focus: false,
             config_path: AppConfig::path().ok(),
             config_mtime: None,
             last_config_poll: std::time::Instant::now(),
@@ -192,6 +194,7 @@ impl LumiTermApp {
             search_open: false,
             search_query: String::new(),
             search_field_focused: false,
+            search_needs_focus: false,
             config_path: None,
             config_mtime: None,
             last_config_poll: std::time::Instant::now(),
@@ -279,8 +282,12 @@ impl LumiTermApp {
 
     fn ingest_events(&mut self, ctx: &egui::Context) {
         // While the search field is focused, keystrokes belong to it; don't
-        // also forward them to the PTY.
-        let search_owns_keys = self.search_open && self.search_field_focused;
+        // also forward them to the PTY. Recomputed per event rather than
+        // hoisted out of the loop: egui delivers everything accumulated since
+        // the last frame in one batch, so a Cmd+F and a keypress arriving
+        // together would otherwise send that key to the shell. The
+        // `needs_focus` term covers the frame the bar opens, before the
+        // widget reports focus.
         let scroll_delta = ctx.input(|input| input.smooth_scroll_delta.y);
         let wheel_lines = (scroll_delta / self.config.terminal.font_size.max(1.0)).round() as i32;
         if wheel_lines != 0
@@ -292,6 +299,8 @@ impl LumiTermApp {
 
         let events = ctx.input(|input| input.events.clone());
         for event in events {
+            let search_owns_keys =
+                self.search_open && (self.search_field_focused || self.search_needs_focus);
             match event {
                 egui::Event::Copy => {
                     self.copy_visible_text(ctx);
@@ -341,6 +350,11 @@ impl LumiTermApp {
                 } => {
                     if key == egui::Key::F && (modifiers.command || modifiers.ctrl) {
                         self.search_open = !self.search_open;
+                        // TextEdit never grabs focus on its own, and the
+                        // search field decides who owns the keyboard. Without
+                        // this, opening the bar with Cmd+F still sent every
+                        // keystroke to the shell.
+                        self.search_needs_focus = self.search_open;
                         continue;
                     }
                     if key == egui::Key::W && modifiers.command && modifiers.shift {
@@ -423,9 +437,11 @@ impl LumiTermApp {
         self.rows = rows;
         self.cols = cols;
         for tab in &mut self.tabs {
+            // One tab failing to resize must not leave the rest of them on the
+            // old grid, so report and carry on rather than bailing out.
             if let Err(error) = tab.session.resize(rows, cols) {
                 self.status_message = Some(format!("resize error: {error}"));
-                break;
+                continue;
             }
             tab.snapshot = tab.session.snapshot();
         }
@@ -691,10 +707,18 @@ impl LumiTermApp {
                             .desired_width(260.0)
                             .font(TextStyle::Monospace),
                     );
+                    if self.search_needs_focus {
+                        // Memory::request_focus sets the focused widget
+                        // immediately, so has_focus() below is already true
+                        // this frame and ingest_events sees it next frame.
+                        response.request_focus();
+                        self.search_needs_focus = false;
+                    }
                     self.search_field_focused = response.has_focus();
 
                     if ui.button("Find").clicked()
-                        || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        || ((response.has_focus() || response.lost_focus())
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                     {
                         match self.run_search() {
                             Some(offset) => {
@@ -714,6 +738,7 @@ impl LumiTermApp {
                         self.search_open = false;
                         self.search_query.clear();
                         self.search_field_focused = false;
+                        self.search_needs_focus = false;
                     }
                 });
             });
